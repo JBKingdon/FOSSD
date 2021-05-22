@@ -12,8 +12,8 @@
 // #define FAST_CODE __attribute__((section(".itcm_text")))
 #define FAST_CODE
 
-#define FAST_DATA __attribute__((section(".dtcm")))
-// #define FAST_DATA
+// #define FAST_DATA __attribute__((section(".dtcm")))
+#define FAST_DATA
 
 TIM_HandleTypeDef htim3, htim4;
 HardwareTimer *hwTimer = new HardwareTimer(TIM3);
@@ -30,10 +30,11 @@ uint32_t frame = 0, line = 0, frameLength = 0;
 
 bool inVsync = false, lookingForField = true, fieldIsEven = true;
 
-// pixel buffer for testing. Characters are 12 pixels wide, 30 chars to a line.
-// We're going to dma the buffer to the gpio bsrr register, so the bits per pixel has to match that, even though
-// we're only using 1 or 2 of the bits.
-#define PIXELS_PER_LINE 362       // 1 extra pixel at each ond of the line to always disable the outputs
+// Characters are 12 pixels wide, 18 pixels high. 30 chars to a line, 16 lines
+
+#define OSD_LINES 288             // not all lines will be visible on ntsc
+#define OSD_PIXELS 360
+#define PIXELS_PER_LINE 362       // 1 extra pixel at each ond of the output line to always disable the outputs
 
 // Pin 0 connected to white, Pin 1 connected to black
 
@@ -72,12 +73,13 @@ uint8_t lineToOutput = 0;
 // flag set by isr handler to signal that the code in loop() should fill the next buffer line
 bool renderNeeded = true;
 
+// flag set by comparator ISR to signal that a new field has started
+// Used by loop to trigger drawing animated elements
+bool newField = false;
+
 // There are 52us per visible line, so 52/360 = 144ns per pixel, equivalent to 6.923 MHz (clock by 34.666 for 240MHz input)
 // Use timer4, connect to DMA to transfer odsLine -> gpio pins
 // We need a 7us delay (plus a bit?) after we detect hsync before starting to output pixels. 1680 ticks @ 240MHz
-
-// How many OSD lines are there to map onto the 625 or 525 video lines? 16 rows of characters x 18 pixels per character = 288 osd lines. Well that's ugly.
-// Probably just send them out on both odd and even. Less rows for ntsc.
 
 // Has to be adjusted by hand to compensate for dma startup delays
 #define LINE_START_DELAY 1300
@@ -87,11 +89,67 @@ bool renderNeeded = true;
 #define CHARACTERS_PER_LINE 30
 #define NUMBER_OF_TEXT_LINES 16
 
-FAST_DATA uint16_t osdFrame[NUMBER_OF_TEXT_LINES][CHARACTERS_PER_LINE];
+// why was this uint16_t and not uint8_t ?
+// FAST_DATA uint16_t osdFrame[NUMBER_OF_TEXT_LINES][CHARACTERS_PER_LINE];
+
+// lookup table to translate from 2bpp font encoding to OSD gpio words
+const uint32_t pixelCoding[] = {OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT};
+
+// pixel frame buffer using 2bpp with the same encoding as the font
+// stored as words with each word having 16 pixels
+#define OSD_WORDS ((OSD_PIXELS+15)/16)
+uint32_t frameBuffer[OSD_LINES][OSD_WORDS];
+
 
 #include "font_default.h"
 
 FAST_DATA uint32_t fastFont[FONT_NCHAR][18];
+
+
+/** Clears at least the bounding box, plus any neighbouring pixels in the same frameBuffer words
+ * 
+ * Pixels are reset to transparent
+ */
+void fastClearBlock(const uint16_t xmin, const uint16_t xmax, const uint16_t ymin, const uint16_t ymax)
+{
+  const uint16_t firstIndex = xmin/16;
+  const uint16_t lastIndex = xmax/16;
+  const uint16_t nWords = (lastIndex - firstIndex) + 1;
+
+  for(uint16_t line = ymin; line <= ymax; line++)
+  {
+    uint32_t *fbPtr = &(frameBuffer[line][firstIndex]);
+    for(uint16_t words = 0; words < nWords; words++)
+    {
+      *fbPtr++ = 0x55555555;
+    }
+  }
+}
+
+/** Set a pixel in the frame buffer
+ * @param value should be one of the font encoding 2bit values (black 0b00, white 0b10, transparent 0bx1)
+ * 
+ * Each word in the buffer covers 16 pixels, so we need to do a read/modify/write
+ * 
+ * There are no safety checks in here to keep the speed up, so be careful with input values.
+ */
+inline void setPixel(const uint16_t x, const uint16_t y, const uint8_t value)
+{
+  // if (y >= OSD_LINES) return; // yeah, I lied. Debugging
+
+  const uint32_t bufferXIndex = x / 16;
+  // if (bufferXIndex >= OSD_WORDS) return;
+
+  const uint32_t shiftCount = (15 - (x % 16)) * 2;
+  uint32_t tmp = frameBuffer[y][bufferXIndex];
+
+  const uint32_t mask = 0b11 << shiftCount;
+
+  tmp &= ~mask;
+  tmp |= value << shiftCount;
+
+  frameBuffer[y][bufferXIndex] = tmp;
+}
 
 /**
  * Expand the font pixels into a GPIO BRSS word
@@ -104,8 +162,6 @@ FAST_DATA uint32_t fastFont[FONT_NCHAR][18];
  */
 inline void drawCharacterRow(const uint8_t chIndex, const uint16_t osdColumn, const uint8_t rowInCharacter, uint32_t *lineBuffer)
 {
-  // lookup table to translate from font pixel encoding to OSD gpio words
-  static const uint32_t pixelCoding[] = {OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT};
 
   // get the character definition from the font table
   const uint32_t *character = fastFont[chIndex];
@@ -121,6 +177,58 @@ inline void drawCharacterRow(const uint8_t chIndex, const uint16_t osdColumn, co
   }
 }
 
+/** Draw the specified character into the frame buffer
+ * 
+ * x,y coordinates in pixels with 0,0 at top left
+ * 
+ */
+void drawCharacter(const uint8_t chIndex, const uint16_t x, const uint16_t y)
+{
+  // get the character definition from the font table
+  const uint32_t *character = fastFont[chIndex];
+
+  // copy 18 lines of font data into the frame buffer
+  for(uint8_t fontLine=0; fontLine<18; fontLine++)
+  {
+    if (y + fontLine >= OSD_LINES) break; // no point trying to draw off the frame buffer
+
+    uint32_t * outputLine = frameBuffer[y + fontLine];
+
+    uint32_t row = character[fontLine];
+    // row contains 12 pixels in bits 0 - 23
+    // if x == 0 then we need to shift the character data 8 bits left, x == 1 shift 6 bits left, x == 4, no shift
+    // x == 5 shift 2 bits right and the write will have to be across 2 words
+    // x == 6 shift 4 bits right
+    // x == 16 shift 24 bits right, nothing in left word, everything in right word
+
+    int8_t xOffset = x % 16;
+    uint16_t firstWordIndex = x / 16;
+    if (xOffset < 5) {
+      // we only need to deal with the first word
+      row = row << ((4 - xOffset) * 2);
+      uint32_t mask = ~(0xFFFFFF << ((4 - xOffset) * 2));
+      uint32_t tmp = outputLine[firstWordIndex] & mask; // clear the bits for the new character
+      tmp |= row;
+      outputLine[firstWordIndex] = tmp;
+    } else {
+      // some of the bits need to go in each word
+      uint32_t leftBits = row >> ((xOffset - 4) * 2);
+      uint32_t leftMask = ~(0xFFFFFF >> ((xOffset - 4) * 2));
+      uint32_t tmp = outputLine[firstWordIndex] & leftMask; // clear the bits for the new character
+      tmp |= leftBits;
+      outputLine[firstWordIndex] = tmp;
+
+      uint32_t rightBits = row << ((20 - xOffset) * 2);
+      uint32_t rightMask = ~(0xFFFFFF << ((20 - xOffset) * 2));
+      tmp = outputLine[firstWordIndex+1] & rightMask; // clear the bits for the new character
+      tmp |= rightBits;
+      outputLine[firstWordIndex+1] = tmp;
+    }
+  }
+}
+
+
+
 /** Draw a string at specified location
  * 
  * Position is in characters with 0,0 in the top left
@@ -134,7 +242,8 @@ void drawString(const uint8_t * str, const uint8_t row, const uint8_t column)
   uint8_t * cPtr = (uint8_t *)str;
   uint8_t x = column;
   while(*cPtr) {
-    osdFrame[row][x++] = *(cPtr++);
+    // osdFrame[row][x++] = *(cPtr++);  // character based
+    drawCharacter(*cPtr++, (x++)*12, row*18);  // pixel based
   }
 }
 
@@ -188,6 +297,7 @@ void ccHandler()
     // it's a vsync pulse, but we get multiple per sync, so only act on the first one
     if (!inVsync) {
       inVsync = true;
+      newField = true;
       frame++;
       if (line > 0) frameLength = line;
       line = 0;
@@ -448,6 +558,49 @@ static void MX_TIM4_Init(void)
 
 // }
 
+void plotGraph()
+{
+  // Plot a simple graph
+
+  const uint16_t startX = 10, startY = 10;
+  const uint16_t width = 120, height = 80;
+
+  const uint8_t AnimationFrames = 25;
+
+  static int8_t direction = 1;
+
+  const uint16_t frameMod = frame % (2 *AnimationFrames);
+  if (frameMod == 0) direction *= -1;
+
+  float scale = ((float)((int32_t)(frameMod/2) - AnimationFrames/2) / (AnimationFrames/2)) * direction;
+  
+  if (scale > 1.0) scale = 1.0;
+  if (scale < -1.0) scale = -1.0;
+
+  scale *= (height/2);
+
+  for(uint16_t x = 0; x < width; x++) {
+    int16_t y = sin((float)x / width * 3.14 * 4) * scale + height/2;
+    setPixel(x + startX, y + startY, 2);
+    setPixel(x + startX, startY + height/2, 2);
+  }
+
+}
+
+void plotGraphB(uint16_t startX, uint16_t startY, uint16_t width, uint16_t height)
+{
+  // Plot a simple graph
+
+  const uint8_t AnimationFrames = 40;
+  const float frameOffset = (float)(frame % AnimationFrames) * 6.28 / AnimationFrames;
+
+  for(uint16_t x = 0; x < width; x++) {
+    int16_t y = sin((float)x / width * 3.14 * 4 + frameOffset) * (height/2) + height/2;
+    setPixel(x + startX, y + startY, 2);
+    setPixel(x + startX, startY + height/2, 2);
+  }
+
+}
 
 // ============================================================================
 
@@ -460,10 +613,19 @@ void setup()
   memcpy((void*)&itcm_text_start, &itcm_data, (int) (&itcm_text_end - &itcm_text_start));
 
   // zero init the osdFrame
-  memset(osdFrame, 0, sizeof(osdFrame));
+  // memset(osdFrame, 0, sizeof(osdFrame));
 
   // copy the font into fast memory
   memcpy(fastFont, font, sizeof(font));
+
+  // init the frame buffer to transparent
+  for(uint32_t i=0; i<OSD_LINES; i++) 
+  {
+    for(uint32_t j=0; j<OSD_WORDS; j++)
+    {
+      frameBuffer[i][j] = 0x55555555;
+    }
+  }
 
   // setLine();
 
@@ -480,27 +642,29 @@ void setup()
   // osdFrame[8][15] = 'X';
   drawString((const uint8_t*)"HELLO WORLD AGAIN!", 6, 6);
 
-  for(int i=0; i<16; i++) {
-    if (i< 10) {
-      osdFrame[i][0] = i + '0';
-    } else {
-        osdFrame[i][0] = i - 10 + 'A';
-    }
-  }
+  // plotGraph();
 
-  for(int i=1; i<30; i++) {
-    osdFrame[0][i] = (i % 10) + '0';
-  }
+  // for(int i=0; i<16; i++) {
+  //   if (i< 10) {
+  //     osdFrame[i][0] = i + '0';
+  //   } else {
+  //       osdFrame[i][0] = i - 10 + 'A';
+  //   }
+  // }
+
+  // for(int i=1; i<30; i++) {
+  //   osdFrame[0][i] = (i % 10) + '0';
+  // }
 
   // display the bf logo
   // 4 lines of 24 chars starting at index 160
-  const uint8_t xStart = 3, yStart = 2;
-  uint8_t cIndex = 160;
-  for(int yc = 0; yc < 4; yc++) {
-    for (int xc = 0; xc < 24; xc++) {
-      osdFrame[yc+yStart][xc+xStart] = cIndex++;
-    }
-  }
+  // const uint8_t xStart = 3, yStart = 2;
+  // uint8_t cIndex = 160;
+  // for(int yc = 0; yc < 4; yc++) {
+  //   for (int xc = 0; xc < 24; xc++) {
+  //     osdFrame[yc+yStart][xc+xStart] = cIndex++;
+  //   }
+  // }
 
 
   // enable the comparator
@@ -706,16 +870,21 @@ FAST_CODE void renderLine()
       buffer[i] = OSD_TRANSPARENT;
     }
   } else {
-    // figure out which line of the character frame buffer we're looking at
-    const uint8_t charLine = (lineToRender - OSD_FIRST_VISIBLE_LINE) / 18;
-    const uint8_t rowInCharacter = (lineToRender - OSD_FIRST_VISIBLE_LINE) % 18;
+    uint32_t osdY = lineToRender - OSD_FIRST_VISIBLE_LINE;
+    uint32_t *osdLine = &(frameBuffer[osdY][0]);
 
-    // for each character in the line
-    for (uint8_t i=0; i<30; i++)
+    uint32_t outputIndex = 1;
+
+    // for each word in the line
+    for (uint16_t i=0; i<OSD_WORDS; i++)
     {
-      // write the row of the character into the output buffer
-      uint8_t charIndex = osdFrame[charLine][i];
-      drawCharacterRow(charIndex, i*12, rowInCharacter, buffer);
+      uint32_t pixelGroup = osdLine[i];
+      // expand the 16 pixels
+      for(int j=0; j<16; j++) 
+      {
+        uint8_t pixel = (pixelGroup >> ((15-j) * 2)) & 0b11;
+        buffer[outputIndex++] = pixelCoding[pixel];
+      }
     }
     // add the special beginning and end of line values
     buffer[0] = OSD_TRANSPARENT;
@@ -735,6 +904,40 @@ void loop() {
 
   static uint32_t ledLastUpdate = 0;
   static uint8_t ledState = 0;
+
+  // Render the next line if needed
+  if (renderNeeded) {
+    uint32_t tStart = micros();
+    renderLine();
+    renderNeeded = false;
+    uint64_t tEnd = micros();
+    if (tEnd < tStart) tEnd += (uint64_t)1 << 32; // compensate for wrap arounds
+    uint32_t tElapsed = tEnd - tStart;
+    totalRenderTimeMicros += tElapsed;
+    nRender++;
+    if (tElapsed > renderMax) renderMax = tElapsed;
+    if (tElapsed < renderMin) renderMin = tElapsed;
+  }
+
+  // redraw animations if we're on a new field
+  if (newField) {
+    newField = false;
+  
+    const uint16_t startX = 10, startY = 10;
+    const uint16_t width = 120, height = 80;
+
+    fastClearBlock(startX, startX+width, startY, startY+height);
+    plotGraph();
+
+    {
+      const uint16_t startX = 250, startY = 175;
+      const uint16_t width = 80, height = 45;
+
+      fastClearBlock(startX, startX+width, startY, startY+height);
+      plotGraphB(startX, startY, width, height);
+    }
+  }
+
 
   uint32_t now = millis();
 
@@ -774,18 +977,6 @@ void loop() {
     nRender = 0;
   }
 
-  // Render the next line if needed
-  if (renderNeeded) {
-    uint32_t tStart = micros();
-    renderLine();
-    renderNeeded = false;
-    uint32_t tEnd = micros();
-    uint32_t tElapsed = (tEnd -tStart);
-    totalRenderTimeMicros += tElapsed;
-    nRender++;
-    if (tElapsed > renderMax) renderMax = tElapsed;
-    if (tElapsed < renderMin) renderMin = tElapsed;
-  }
 
 
   // needs a last debug time variable
