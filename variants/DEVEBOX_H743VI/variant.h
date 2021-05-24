@@ -215,6 +215,8 @@ extern "C" {
 /* Extra HAL modules */
 #define HAL_DAC_MODULE_ENABLED
 // #define HAL_ETH_MODULE_ENABLED
+#define HAL_COMP_MODULE_ENABLED
+#define HAL_DMA2D_MODULE_ENABLED
 
 #ifdef __cplusplus
 } // extern "C"

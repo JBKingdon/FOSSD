@@ -3,7 +3,13 @@
 
 #include <stdio.h>
 
+// DMA2D requires the opposite pixel in word order vs my original code
+#define FB_REVERSE_PIXEL_ORDER
+
 // Next: 
+
+// dma2d to clear the blocks
+// dma2d straight to gpio?
 
 // use an op amp and the adc to do AGC?
 // strip out the arduino stuff
@@ -15,9 +21,13 @@
 // #define FAST_DATA __attribute__((section(".dtcm")))
 #define FAST_DATA
 
-TIM_HandleTypeDef htim3, htim4;
 HardwareTimer *hwTimer = new HardwareTimer(TIM3);
+
+TIM_HandleTypeDef htim3, htim4;
 DMA_HandleTypeDef hdma_tim4_ch1;
+DMA2D_HandleTypeDef hdma2d;
+COMP_HandleTypeDef hcomp1;
+
 
 bool testBit;
 
@@ -46,7 +56,7 @@ bool inVsync = false, lookingForField = true, fieldIsEven = true;
 
 // 0: Black active low
 // 1: White active low
-// 3: Video gate, set = pass, reset = block
+// 3: Video gate, high = pass, low = block
 #define OSD_BLACK (GPIO_BSRR_BR0 | GPIO_BSRR_BS1 | GPIO_BSRR_BR3)
 #define OSD_WHITE (GPIO_BSRR_BS0 | GPIO_BSRR_BR1 | GPIO_BSRR_BR3)
 #define OSD_TRANSPARENT (GPIO_BSRR_BS0 | GPIO_BSRR_BS1 | GPIO_BSRR_BS3)
@@ -85,35 +95,113 @@ bool newField = false;
 #define LINE_START_DELAY 1300
 #define OSD_FIRST_VISIBLE_LINE 16
 
-// define the character frame buffer for the OSD
+// For easy conversion from max7456, we still match the original character positions
 #define CHARACTERS_PER_LINE 30
 #define NUMBER_OF_TEXT_LINES 16
 
-// why was this uint16_t and not uint8_t ?
-// FAST_DATA uint16_t osdFrame[NUMBER_OF_TEXT_LINES][CHARACTERS_PER_LINE];
 
 // lookup table to translate from 2bpp font encoding to OSD gpio words
 const uint32_t pixelCoding[] = {OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT};
 
-// pixel frame buffer using 2bpp with the same encoding as the font
-// stored as words with each word having 16 pixels
-#define OSD_WORDS ((OSD_PIXELS+15)/16)
-uint32_t frameBuffer[OSD_LINES][OSD_WORDS];
+// pixel frame buffer using 4bpp. Lower 2 bits usethe same encoding as the font,
+// upper 2 bits are currently ignored (use to implement flashing?)
+// stored as words with each word having 8 pixels
+#define FB_WORDS ((OSD_PIXELS+7)/8)
+uint32_t frameBuffer[OSD_LINES][FB_WORDS];
+
+#define FB_TRANSPARENT 0x11111111
 
 
 #include "font_default.h"
 
-FAST_DATA uint32_t fastFont[FONT_NCHAR][18];
+// This uses an expanded 4bpp format to match the frame buffer. The original font data
+// will need to be translated when copying into this array.
+FAST_DATA uint8_t fastFont[FONT_NCHAR][18][6];
 
+/** Clear one line of OSD output to transparent
+ */
+void clearOSDLine(uint32_t *osdLine)
+{
+  // make sure there isn't something already running
+  HAL_DMA2D_PollForTransfer(&hdma2d, 100);
+
+  // config dma2d
+  hdma2d.Instance = DMA2D;
+  hdma2d.Init.Mode = DMA2D_R2M;
+  hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
+  hdma2d.Init.OutputOffset = 0;
+  hdma2d.Init.BytesSwap = DMA2D_BYTES_REGULAR;
+  hdma2d.Init.LineOffsetMode = DMA2D_LOM_PIXELS;
+  if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  uint32_t pdata = OSD_TRANSPARENT;
+  uint32_t dstAddress = (uint32_t)osdLine;
+
+  HAL_StatusTypeDef d2dStatus = HAL_DMA2D_Start(&hdma2d, pdata, dstAddress, PIXELS_PER_LINE, 1); // width in words not pixels
+
+  if (d2dStatus != HAL_OK) {
+    Serial.print("failed to start dma2d ");
+    Serial.println(d2dStatus);
+  }
+}
+
+void renderODSLine(uint8_t * fbLine, uint32_t * osdLine)
+{
+  // config dma2d
+  hdma2d.Instance = DMA2D;
+  hdma2d.Init.Mode = DMA2D_M2M_PFC;
+  hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
+  hdma2d.Init.OutputOffset = 0;
+  hdma2d.Init.BytesSwap = DMA2D_BYTES_REGULAR;
+  hdma2d.Init.LineOffsetMode = DMA2D_LOM_BYTES;
+
+  HAL_DMA2D_PollForTransfer(&hdma2d, 1000);
+  if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // setup the input processing
+  hdma2d.LayerCfg[DMA2D_FOREGROUND_LAYER].InputColorMode = DMA2D_INPUT_L4;
+  hdma2d.LayerCfg[DMA2D_FOREGROUND_LAYER].InputOffset = 0;
+  hdma2d.LayerCfg[DMA2D_FOREGROUND_LAYER].AlphaMode = DMA2D_NO_MODIF_ALPHA;
+
+  if (HAL_DMA2D_ConfigLayer(&hdma2d, DMA2D_FOREGROUND_LAYER) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // manually add first and last
+  osdLine[0] = OSD_TRANSPARENT;
+  osdLine[PIXELS_PER_LINE-1] = OSD_TRANSPARENT;
+
+  #ifndef D_CACHE_DISABLED
+  SCB_CleanDCache_by_Addr(&osdLine[0], 4);
+  SCB_CleanDCache_by_Addr(&osdLine[PIXELS_PER_LINE-1], 4);
+  #endif
+
+  uint32_t pdata = (uint32_t) fbLine;
+  uint32_t destAddr = (uint32_t) (osdLine + 1); // skip the first pixel of the line
+  if (HAL_DMA2D_Start(&hdma2d, pdata, destAddr, OSD_PIXELS, 1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
 
 /** Clears at least the bounding box, plus any neighbouring pixels in the same frameBuffer words
+ * 
+ * XXX rewrite with dma2d
  * 
  * Pixels are reset to transparent
  */
 void fastClearBlock(const uint16_t xmin, const uint16_t xmax, const uint16_t ymin, const uint16_t ymax)
 {
-  const uint16_t firstIndex = xmin/16;
-  const uint16_t lastIndex = xmax/16;
+  const uint16_t firstIndex = xmin/8;
+  const uint16_t lastIndex = xmax/8;
   const uint16_t nWords = (lastIndex - firstIndex) + 1;
 
   for(uint16_t line = ymin; line <= ymax; line++)
@@ -121,7 +209,7 @@ void fastClearBlock(const uint16_t xmin, const uint16_t xmax, const uint16_t ymi
     uint32_t *fbPtr = &(frameBuffer[line][firstIndex]);
     for(uint16_t words = 0; words < nWords; words++)
     {
-      *fbPtr++ = 0x55555555;
+      *fbPtr++ = FB_TRANSPARENT;
     }
   }
 }
@@ -129,7 +217,7 @@ void fastClearBlock(const uint16_t xmin, const uint16_t xmax, const uint16_t ymi
 /** Set a pixel in the frame buffer
  * @param value should be one of the font encoding 2bit values (black 0b00, white 0b10, transparent 0bx1)
  * 
- * Each word in the buffer covers 16 pixels, so we need to do a read/modify/write
+ * Each word in the buffer covers 8 pixels, so we need to do a read/modify/write
  * 
  * There are no safety checks in here to keep the speed up, so be careful with input values.
  */
@@ -137,13 +225,18 @@ inline void setPixel(const uint16_t x, const uint16_t y, const uint8_t value)
 {
   // if (y >= OSD_LINES) return; // yeah, I lied. Debugging
 
-  const uint32_t bufferXIndex = x / 16;
+  const uint32_t bufferXIndex = x / 8;
   // if (bufferXIndex >= OSD_WORDS) return;
 
-  const uint32_t shiftCount = (15 - (x % 16)) * 2;
+  #ifdef FB_REVERSE_PIXEL_ORDER
+  const uint32_t shiftCount = (x % 8) * 4;
+  #else
+  const uint32_t shiftCount = (7 - (x % 8)) * 4;
+  #endif
+
   uint32_t tmp = frameBuffer[y][bufferXIndex];
 
-  const uint32_t mask = 0b11 << shiftCount;
+  const uint32_t mask = 0b1111 << shiftCount;
 
   tmp &= ~mask;
   tmp |= value << shiftCount;
@@ -151,81 +244,63 @@ inline void setPixel(const uint16_t x, const uint16_t y, const uint8_t value)
   frameBuffer[y][bufferXIndex] = tmp;
 }
 
-/**
- * Expand the font pixels into a GPIO BRSS word
- * 
- * Used when rendering a line of character data into an output buffer which will be transferred
- * by DMA to the gpio combined set/reset register. The character index is used to look up the pixels
- * in the font table. Each pixel is converted to the corresponding 32 bit brss pattern using the OSD_BLACK,
- * OSD_WHITE and OSD_TRANSPARENT defines and then written into the corresponding location of the output buffer.
- * 
- */
-inline void drawCharacterRow(const uint8_t chIndex, const uint16_t osdColumn, const uint8_t rowInCharacter, uint32_t *lineBuffer)
-{
-
-  // get the character definition from the font table
-  const uint32_t *character = fastFont[chIndex];
-
-  // get the row of the character that needs to be rendered
-  const uint32_t row = character[rowInCharacter];
-
-  // convert the 12 pixels of the row into the gpio bsrr output format for the osd pixels
-  for (uint32_t i=0; i<12; i++)
-  {
-    const uint8_t pixel = (row >> ((11 - i) * 2)) & 0b11;
-    lineBuffer[osdColumn + i] = pixelCoding[pixel];
-  }
-}
 
 /** Draw the specified character into the frame buffer
  * 
  * x,y coordinates in pixels with 0,0 at top left
  * 
+ * This version is obviously very innefficient, but it's soon to be replaced with dma2d anyway
+ * 
  */
+// void drawCharacter(const uint8_t chIndex, const uint16_t x, const uint16_t y)
+// {
+//   // XXX convert to dma2d
+
+//   // get the character definition from the font table
+//   uint32_t * character = font[chIndex];
+
+//   // copy 18 lines of font data into the frame buffer
+//   for(uint8_t fontLine=0; fontLine<18; fontLine++)
+//   {
+//     if (y + fontLine >= OSD_LINES) break; // no point trying to draw off the frame buffer
+
+//     uint32_t row = character[fontLine];
+
+//     // row contains 12 pixels, 2bpp in bits 23 to 0
+//     for(int pixelCounter=0; pixelCounter<12; pixelCounter++) {
+//       uint8_t pixelValue = (row >> ((11 - pixelCounter) * 2)) & 0b11;
+//       setPixel(x+pixelCounter, y+fontLine, pixelValue);
+//     }
+
+//   } // for each line
+// }
+
 void drawCharacter(const uint8_t chIndex, const uint16_t x, const uint16_t y)
 {
-  // get the character definition from the font table
-  const uint32_t *character = fastFont[chIndex];
+  // XXX convert to dma2d
+
+  // get the start of the character data from the font table
+  uint8_t * character = fastFont[chIndex][0];
 
   // copy 18 lines of font data into the frame buffer
   for(uint8_t fontLine=0; fontLine<18; fontLine++)
   {
     if (y + fontLine >= OSD_LINES) break; // no point trying to draw off the frame buffer
 
-    uint32_t * outputLine = frameBuffer[y + fontLine];
+    uint16_t lineX = x;
 
-    uint32_t row = character[fontLine];
-    // row contains 12 pixels in bits 0 - 23
-    // if x == 0 then we need to shift the character data 8 bits left, x == 1 shift 6 bits left, x == 4, no shift
-    // x == 5 shift 2 bits right and the write will have to be across 2 words
-    // x == 6 shift 4 bits right
-    // x == 16 shift 24 bits right, nothing in left word, everything in right word
-
-    int8_t xOffset = x % 16;
-    uint16_t firstWordIndex = x / 16;
-    if (xOffset < 5) {
-      // we only need to deal with the first word
-      row = row << ((4 - xOffset) * 2);
-      uint32_t mask = ~(0xFFFFFF << ((4 - xOffset) * 2));
-      uint32_t tmp = outputLine[firstWordIndex] & mask; // clear the bits for the new character
-      tmp |= row;
-      outputLine[firstWordIndex] = tmp;
-    } else {
-      // some of the bits need to go in each word
-      uint32_t leftBits = row >> ((xOffset - 4) * 2);
-      uint32_t leftMask = ~(0xFFFFFF >> ((xOffset - 4) * 2));
-      uint32_t tmp = outputLine[firstWordIndex] & leftMask; // clear the bits for the new character
-      tmp |= leftBits;
-      outputLine[firstWordIndex] = tmp;
-
-      uint32_t rightBits = row << ((20 - xOffset) * 2);
-      uint32_t rightMask = ~(0xFFFFFF << ((20 - xOffset) * 2));
-      tmp = outputLine[firstWordIndex+1] & rightMask; // clear the bits for the new character
-      tmp |= rightBits;
-      outputLine[firstWordIndex+1] = tmp;
+    // each row contains 6 bytes each with 2 pixels
+    for(int byteCounter = 0; byteCounter<6; byteCounter++) {
+      const uint8_t fontPixelPair = *character++;
+      const uint8_t firstP = (fontPixelPair >> 4) & 0b11;
+      setPixel(lineX++, y+fontLine, firstP);
+      const uint8_t secondP = fontPixelPair & 0b11;
+      setPixel(lineX++, y+fontLine, secondP);
     }
-  }
+
+  } // for each line
 }
+
 
 
 
@@ -330,49 +405,6 @@ void ccHandler()
       Serial.println(status);
     }
 
-
-    // if (line > 140 && line < 158)
-    // {
-    //   // if you don't call this, the HAL_DMA_Start call fails, but it's pretty heavy weight, so it would be good
-    //   // to figure out what the minimum action is.
-    //   HAL_DMA_Abort(&hdma_tim4_ch1);
-
-    //   HAL_StatusTypeDef status = HAL_DMA_Start_IT(&hdma_tim4_ch1, (uint32_t)&(osdTextLines[(line-140)*PIXELS_PER_LINE]), (uint32_t)&(GPIOC->BSRR), PIXELS_PER_LINE);
-    //   if (HAL_OK != status) {
-    //     Serial.print("dma start failed ");
-    //     Serial.println(status);
-    //   }
-    // // } else if (line > 100 && line < 200)
-    // // {
-    // //   // Display the test pattern line
-    // //
-    // //   // if you don't call this, the HAL_DMA_Start call fails, but it's pretty heavy weight, so it would be good
-    // //   // to figure out what the minimum action is.
-    // //   HAL_DMA_Abort(&hdma_tim4_ch1);
-
-    // //   HAL_StatusTypeDef status = HAL_DMA_Start(&hdma_tim4_ch1, (uint32_t)&(osdLine[0]), (uint32_t)&(GPIOC->BSRR), PIXELS_PER_LINE);
-    // //   // HAL_StatusTypeDef status = HAL_DMA_Start(&hdma_tim4_ch1, (uint32_t)&(osdTextLines[9*PIXELS_PER_LINE]), (uint32_t)&(GPIOC->BSRR), PIXELS_PER_LINE);
-
-    // //   if (HAL_OK != status) {
-    // //     Serial.print("dma start failed ");
-    // //     Serial.println(status);
-    // //   }
-    // }
-
-
-    // __HAL_TIM_ENABLE_DMA(&htim4, TIM_DMA_CC1); // needed?
-    // do we need to clear an interrupt bit?
-
-
-    // hwTimer->resume();
-
-    // This block confirmed that writing to GPIOC->BSRR toggles the gpio in the expected manner
-    // if (testBit) {
-    //   GPIOC->BSRR = GPIO_BSRR_BS0;
-    // } else {
-    //   GPIOC->BSRR = GPIO_BSRR_BR0;
-    // }
-    // testBit = !testBit;
 
   } else {
     // short "equalising" pulses come before and after the long vsync pulses
@@ -506,62 +538,11 @@ static void MX_TIM4_Init(void)
 
 }
 
-// void setLine()
-// {
-//     // Setup some simple geometric pattern in the output buffer
-//   // bit 0 pulls the video darker when set
-//   // bit 1 pulls the video lighter when set
-
-//   for(int i=1; i<(PIXELS_PER_LINE-9); ) {
-
-//     // 2 black pixels
-//     osdLine[i++] = OSD_BLACK;
-//     osdLine[i++] = OSD_BLACK;
-
-//     // 4 white pixels
-//     osdLine[i++] = OSD_WHITE;
-//     osdLine[i++] = OSD_WHITE;
-//     osdLine[i++] = OSD_WHITE;
-//     osdLine[i++] = OSD_WHITE;
-
-//     // 2 black pixels
-//     osdLine[i++] = OSD_BLACK;
-//     osdLine[i++] = OSD_BLACK;
-
-//     // 8 unmodified pixels
-//     for (int t=0; t<8; t++) {
-//       if (i>=PIXELS_PER_LINE-1) break;  // don't overrun the buffer
-//       osdLine[i++] = OSD_TRANSPARENT;
-//     }
-
-//     // // divide the line into blocks
-//     // // black signal on bit 0
-//     // int block = (i-1)/12;
-//     // if (block % 2) {
-//     //   osdLine[i] = GPIO_BSRR_BS0;
-//     // } else {
-//     //   osdLine[i] = GPIO_BSRR_BR0;
-//     // }
-//     // // white signal on bit1
-//     // block = (i-1)/24;
-//     // if (block % 2) {
-//     //   osdLine[i] |= GPIO_BSRR_BR1;
-//     // } else {
-//     //   osdLine[i] |= GPIO_BSRR_BS1;
-//     // }
-
-//   }
-//   // The first and last entries in the buffer must always reset the outputs so we don't corrupt the sync pulse
-//   // (the first value seems to get sent prematurely. A better fix would be to stop that happening)
-//   osdLine[0]                 = OSD_TRANSPARENT;
-//   osdLine[PIXELS_PER_LINE-1] = OSD_TRANSPARENT;
-
-// }
-
+/** Plot a simple graph for demo purposes
+ * Sinewave with animated amplitude
+ */
 void plotGraph()
 {
-  // Plot a simple graph
-
   const uint16_t startX = 10, startY = 10;
   const uint16_t width = 120, height = 80;
 
@@ -584,13 +565,13 @@ void plotGraph()
     setPixel(x + startX, y + startY, 2);
     setPixel(x + startX, startY + height/2, 2);
   }
-
 }
 
+/** Plot a simple graph for demo purposes
+ * Sinewave with animated offset
+ */
 void plotGraphB(uint16_t startX, uint16_t startY, uint16_t width, uint16_t height)
 {
-  // Plot a simple graph
-
   const uint8_t AnimationFrames = 40;
   const float frameOffset = (float)(frame % AnimationFrames) * 6.28 / AnimationFrames;
 
@@ -599,75 +580,13 @@ void plotGraphB(uint16_t startX, uint16_t startY, uint16_t width, uint16_t heigh
     setPixel(x + startX, y + startY, 2);
     setPixel(x + startX, startY + height/2, 2);
   }
-
 }
 
 // ============================================================================
 
-void setup()
+void enableClocks()
 {
-    /* Load functions into ITCM RAM */
-  extern const unsigned char itcm_text_start;
-  extern const unsigned char itcm_text_end;
-  extern const unsigned char itcm_data;
-  memcpy((void*)&itcm_text_start, &itcm_data, (int) (&itcm_text_end - &itcm_text_start));
-
-  // zero init the osdFrame
-  // memset(osdFrame, 0, sizeof(osdFrame));
-
-  // copy the font into fast memory
-  memcpy(fastFont, font, sizeof(font));
-
-  // init the frame buffer to transparent
-  for(uint32_t i=0; i<OSD_LINES; i++) 
-  {
-    for(uint32_t j=0; j<OSD_WORDS; j++)
-    {
-      frameBuffer[i][j] = 0x55555555;
-    }
-  }
-
-  // setLine();
-
-  delay(100);
-
-  // flush the line out of the data cache
-  // #ifndef D_CACHE_DISABLED
-  // SCB_CleanDCache_by_Addr((uint32_t*)osdLine, PIXELS_PER_LINE*4);
-
-  // SCB_CleanDCache_by_Addr((uint32_t*)osdTextLines, PIXELS_PER_LINE*4*18);
-  // #endif
-
-  // Put some content into the frame buffer
-  // osdFrame[8][15] = 'X';
-  drawString((const uint8_t*)"HELLO WORLD AGAIN!", 6, 6);
-
-  // plotGraph();
-
-  // for(int i=0; i<16; i++) {
-  //   if (i< 10) {
-  //     osdFrame[i][0] = i + '0';
-  //   } else {
-  //       osdFrame[i][0] = i - 10 + 'A';
-  //   }
-  // }
-
-  // for(int i=1; i<30; i++) {
-  //   osdFrame[0][i] = (i % 10) + '0';
-  // }
-
-  // display the bf logo
-  // 4 lines of 24 chars starting at index 160
-  // const uint8_t xStart = 3, yStart = 2;
-  // uint8_t cIndex = 160;
-  // for(int yc = 0; yc < 4; yc++) {
-  //   for (int xc = 0; xc < 24; xc++) {
-  //     osdFrame[yc+yStart][xc+xStart] = cIndex++;
-  //   }
-  // }
-
-
-  // enable the comparator
+    // enable the comparator
   __HAL_RCC_COMP12_CLK_ENABLE();
 
   // enable the timer
@@ -682,7 +601,12 @@ void setup()
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_DMA2D_CLK_ENABLE();
+}
+
+void setupGPIO()
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   // Pin for timer4 (tim4 is for the DMA for the OSD pixel output)
   // Will we still need a hardware pin once the dma is linked up internally?
@@ -726,6 +650,198 @@ void setup()
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /**COMP1 GPIO Configuration
+  PC5     ------> COMP1_OUT
+  PB0     ------> COMP1_INP
+  */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF13_COMP1;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  // resource config for tim3, used to measure the pulse interval and duration
+  /**TIM3 GPIO Configuration
+  PA6     ------> TIM3_CH1    // XXX do we still need to use a gpio if the timer is connected to the comp?
+  */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  // GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+}
+
+void setup()
+{
+  // uint32_t tStart, tEnd, tFbInit;
+
+    /* Load functions into ITCM RAM */
+  extern const unsigned char itcm_text_start;
+  extern const unsigned char itcm_text_end;
+  extern const unsigned char itcm_data;
+  memcpy((void*)&itcm_text_start, &itcm_data, (int) (&itcm_text_end - &itcm_text_start));
+
+  // zero init the osdFrame
+  // memset(osdFrame, 0, sizeof(osdFrame));
+
+  // copy the font into fast memory
+  // Can't just memcpy anymore, we need to do 2bpp to 4bpp conversion
+  for(int i=0; i<FONT_NCHAR; i++)
+  {
+    for(int line=0; line<18; line++) {
+      uint32_t inputRow = font[i][line];
+      // input contains 12 pixels at 2bpp in bits 23 to 0
+      // output needs 12 pixels at 4bpp in 6 bytes
+      for(int byteCount = 0; byteCount<6; byteCount++) {
+        uint8_t firstNibble = (inputRow >> ((5 - byteCount) * 4 + 2)) & 0b11;
+        uint8_t secondNibble = (inputRow >> ((5 - byteCount) * 4)) & 0b11;
+        fastFont[i][line][byteCount] = (firstNibble << 4) | secondNibble;
+      }
+    }
+  }
+
+  delay(1000);
+
+  // Put some content into the frame buffer
+
+  // plotGraph();
+
+  // for(int i=0; i<16; i++) {
+  //   if (i< 10) {
+  //     osdFrame[i][0] = i + '0';
+  //   } else {
+  //       osdFrame[i][0] = i - 10 + 'A';
+  //   }
+  // }
+
+  // for(int i=1; i<30; i++) {
+  //   osdFrame[0][i] = (i % 10) + '0';
+  // }
+
+  // display the bf logo
+  // 4 lines of 24 chars starting at index 160
+  // const uint8_t xStart = 3, yStart = 2;
+  // uint8_t cIndex = 160;
+  // for(int yc = 0; yc < 4; yc++) {
+  //   for (int xc = 0; xc < 24; xc++) {
+  //     osdFrame[yc+yStart][xc+xStart] = cIndex++;
+  //   }
+  // }
+
+  enableClocks();
+
+  setupGPIO();
+
+  // set PA1 for output to the LED
+  pinMode(D1, OUTPUT);
+
+  pinMode(D24, OUTPUT); // PA4 which is DAC1_OUT1
+
+  analogWrite(D24, 16); // 0.2V threshold for sync pulses
+
+
+  Serial.begin(460800);
+  Serial.println("Hello!");
+
+
+  // main comp config
+  hcomp1.Instance = COMP1;
+  hcomp1.Init.InvertingInput = COMP_INPUT_MINUS_DAC1_CH1;
+  hcomp1.Init.NonInvertingInput = COMP_INPUT_PLUS_IO1;
+  hcomp1.Init.OutputPol = COMP_OUTPUTPOL_INVERTED;
+  hcomp1.Init.Hysteresis = COMP_HYSTERESIS_LOW;
+  hcomp1.Init.BlankingSrce = COMP_BLANKINGSRC_NONE;
+  hcomp1.Init.Mode = COMP_POWERMODE_HIGHSPEED;
+  hcomp1.Init.WindowMode = COMP_WINDOWMODE_DISABLE;
+  hcomp1.Init.TriggerMode = COMP_TRIGGERMODE_NONE;
+  if (HAL_COMP_Init(&hcomp1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // start the comparator
+  if (HAL_COMP_Start(&hcomp1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+
+  // config dma2d
+  hdma2d.Instance = DMA2D;
+  hdma2d.Init.Mode = DMA2D_R2M;
+  hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
+  hdma2d.Init.OutputOffset = 0;
+  hdma2d.Init.BytesSwap = DMA2D_BYTES_REGULAR;
+  hdma2d.Init.LineOffsetMode = DMA2D_LOM_BYTES;
+  if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // Use dma2d to initialise the frmaebuffer to transparent
+  uint32_t pdata = FB_TRANSPARENT;
+  uint32_t dstAddress = (uint32_t)&(frameBuffer[0][0]);
+  // tStart = micros();
+  // took 31us, almost identical to the explicit loop, but can be run in the background with 1us startup time
+  HAL_StatusTypeDef d2dStatus = HAL_DMA2D_Start(&hdma2d, pdata, dstAddress, FB_WORDS, OSD_LINES); // width in words not pixels
+
+  if (d2dStatus != HAL_OK) {
+    Serial.print("failed to start dma2d ");
+    Serial.println(d2dStatus);
+  } else {
+    // to measure the transfer time we need to loop until the above transaction is complete
+    // timeout is in ticks??? How fast is a tick? Looks like ticks are 1ms
+    // HAL_DMA2D_PollForTransfer(&hdma2d, 1000);
+  }
+
+  // tEnd = micros();
+  // tFbInit = tEnd - tStart;
+  // char buffer[32];
+
+  // sprintf(buffer, "FB INIT %ld", tFbInit);
+  // drawString((const uint8_t *)buffer, 0, 15);
+
+  // Now setup the dma2d for line conversions
+  hdma2d.Init.Mode = DMA2D_M2M_PFC;
+  HAL_DMA2D_PollForTransfer(&hdma2d, 1000);
+  if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // Need a CLUT from L4 to OSD 32 bpp values.
+  ALIGN_32BYTES (uint32_t CLUT_NORMAL[]) = {OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT,
+                                  OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT,
+                                  OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT,
+                                  OSD_BLACK, OSD_TRANSPARENT, OSD_WHITE, OSD_TRANSPARENT};
+
+  #ifndef D_CACHE_DISABLED
+  SCB_CleanDCache_by_Addr(CLUT_NORMAL, sizeof(CLUT_NORMAL));
+  #endif
+
+  DMA2D_CLUTCfgTypeDef clutCfg;
+
+  clutCfg.CLUTColorMode = DMA2D_CCM_ARGB8888;
+  clutCfg.pCLUT = (uint32_t *)CLUT_NORMAL;
+  clutCfg.Size = 16;
+
+  if (HAL_DMA2D_CLUTStartLoad(&hdma2d, &clutCfg, DMA2D_FOREGROUND_LAYER) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  HAL_DMA2D_PollForTransfer(&hdma2d, 1000);
+
+  drawString((const uint8_t*)"DMA2D IS GO!", 6, 10);
 
   // setup timer4
   MX_TIM4_Init();
@@ -747,71 +863,6 @@ void setup()
     Error_Handler();
   }
 
-  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
-
-  __HAL_LINKDMA(&htim4,hdma[TIM_DMA_ID_CC1],hdma_tim4_ch1);
-
-
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-
-  __HAL_TIM_ENABLE_DMA(&htim4, TIM_DMA_CC1); // required
-
-  // set PA1 for output to the LED
-  pinMode(D1, OUTPUT);
-
-  // pinMode(D79, OUTPUT);
-
-  pinMode(D24, OUTPUT); // PA4 which is DAC1_OUT1
-
-  analogWrite(D24, 16); // 0.2V threshold for sync pulses
-
-  Serial.begin(460800);
-  Serial.println("Hello!");
-
-
-  /**COMP1 GPIO Configuration
-  PC5     ------> COMP1_OUT
-  PB0     ------> COMP1_INP
-  */
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF13_COMP1;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  // main comp config
-  COMP_HandleTypeDef hcomp1;
-  hcomp1.Instance = COMP1;
-  hcomp1.Init.InvertingInput = COMP_INPUT_MINUS_DAC1_CH1;
-  hcomp1.Init.NonInvertingInput = COMP_INPUT_PLUS_IO1;
-  hcomp1.Init.OutputPol = COMP_OUTPUTPOL_INVERTED;
-  hcomp1.Init.Hysteresis = COMP_HYSTERESIS_LOW;
-  hcomp1.Init.BlankingSrce = COMP_BLANKINGSRC_NONE;
-  hcomp1.Init.Mode = COMP_POWERMODE_HIGHSPEED;
-  hcomp1.Init.WindowMode = COMP_WINDOWMODE_DISABLE;
-  hcomp1.Init.TriggerMode = COMP_TRIGGERMODE_NONE;
-  if (HAL_COMP_Init(&hcomp1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  // resource config for tim3, used to measure the pulse interval and duration
-  /**TIM3 GPIO Configuration
-  PA6     ------> TIM3_CH1    // XXX do we still need to use a gpio if the timer is connected to the comp?
-  */
-  GPIO_InitStruct.Pin = GPIO_PIN_6;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  // GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   // setup the measurement timer (timer3) with arduino calls for now
   #define CHANNEL1 1
@@ -840,16 +891,20 @@ void setup()
   HAL_TIMEx_TISelection(&htim3, TIM_TIM3_TI1_COMP1, TIM_CHANNEL_1);
   HAL_TIMEx_TISelection(&htim3, TIM_TIM3_TI1_COMP1, TIM_CHANNEL_2);
 
-  // start the comparator
-  if (HAL_COMP_Start(&hcomp1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
   // HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   // HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+  // Turn things on
+
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+  __HAL_LINKDMA(&htim4,hdma[TIM_DMA_ID_CC1],hdma_tim4_ch1);
+
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+
+  __HAL_TIM_ENABLE_DMA(&htim4, TIM_DMA_CC1); // required
 
 
   // start the timer
@@ -858,6 +913,46 @@ void setup()
 }
 
 // is fast code working? It seems to make things slower ?!
+// FAST_CODE void renderLine()
+// {
+//   uint32_t * buffer = osdOutputBuffers[(lineToOutput + 1) % N_OSD_BUFFER_LINES];
+//   uint16_t lineToRender = line + 2; // may need to store lineToRender in the dma interrupt handler to avoid race conditions
+//   if (lineToRender < OSD_FIRST_VISIBLE_LINE || lineToRender > (OSD_FIRST_VISIBLE_LINE + 288))
+//   {
+//     // need to blank the output buffer
+//     for(int i=0; i<PIXELS_PER_LINE; i++)
+//     {
+//       buffer[i] = OSD_TRANSPARENT;
+//     }
+//   } else {
+//     uint32_t osdY = lineToRender - OSD_FIRST_VISIBLE_LINE;
+//     uint32_t *osdLine = &(frameBuffer[osdY][0]);
+
+//     uint32_t outputIndex = 1;
+
+//     // for each word in the line
+//     for (uint16_t i=0; i<FB_WORDS; i++)
+//     {
+//       uint32_t pixelGroup = osdLine[i];
+//       // expand the 8 pixels
+//       for(int j=0; j<8; j++) 
+//       {
+//         uint8_t pixel = (pixelGroup >> ((7-j) * 4)) & 0b11; // ignore the higher bits
+//         buffer[outputIndex++] = pixelCoding[pixel];
+//       }
+//     }
+//     // add the special beginning and end of line values
+//     buffer[0] = OSD_TRANSPARENT;
+//     buffer[PIXELS_PER_LINE-1] = OSD_TRANSPARENT;
+//   }
+
+//   // force the buffer line out of the data cache
+//   #ifndef D_CACHE_DISABLED
+//   SCB_CleanDCache_by_Addr((uint32_t*)buffer, PIXELS_PER_LINE*4);
+//   #endif
+
+// }
+
 FAST_CODE void renderLine()
 {
   uint32_t * buffer = osdOutputBuffers[(lineToOutput + 1) % N_OSD_BUFFER_LINES];
@@ -865,38 +960,35 @@ FAST_CODE void renderLine()
   if (lineToRender < OSD_FIRST_VISIBLE_LINE || lineToRender > (OSD_FIRST_VISIBLE_LINE + 288))
   {
     // need to blank the output buffer
-    for(int i=0; i<PIXELS_PER_LINE; i++)
-    {
-      buffer[i] = OSD_TRANSPARENT;
-    }
+    clearOSDLine(buffer);
+
+    // HAL_DMA2D_PollForTransfer(&hdma2d, 100);
+    // for(int i=0; i<PIXELS_PER_LINE; i++) {
+    //   if (buffer[i] != OSD_TRANSPARENT) {
+    //     Serial.println("clear failed");
+    //     break;
+    //   }
+    // }
+
   } else {
     uint32_t osdY = lineToRender - OSD_FIRST_VISIBLE_LINE;
     uint32_t *osdLine = &(frameBuffer[osdY][0]);
 
-    uint32_t outputIndex = 1;
+    #ifndef D_CACHE_DISABLED
+    SCB_CleanDCache_by_Addr(osdLine, FB_WORDS*4);
+    #endif
 
-    // for each word in the line
-    for (uint16_t i=0; i<OSD_WORDS; i++)
-    {
-      uint32_t pixelGroup = osdLine[i];
-      // expand the 16 pixels
-      for(int j=0; j<16; j++) 
-      {
-        uint8_t pixel = (pixelGroup >> ((15-j) * 2)) & 0b11;
-        buffer[outputIndex++] = pixelCoding[pixel];
-      }
-    }
-    // add the special beginning and end of line values
-    buffer[0] = OSD_TRANSPARENT;
-    buffer[PIXELS_PER_LINE-1] = OSD_TRANSPARENT;
+    renderODSLine((uint8_t *)osdLine, buffer);
+
   }
 
   // force the buffer line out of the data cache
-  #ifndef D_CACHE_DISABLED
-  SCB_CleanDCache_by_Addr((uint32_t*)buffer, PIXELS_PER_LINE*4);
-  #endif
+  // #ifndef D_CACHE_DISABLED
+  // SCB_CleanDCache_by_Addr(buffer, PIXELS_PER_LINE*4);
+  // #endif
 
 }
+
 
 #define LED_INTERVAL_MS 500
 
